@@ -18,6 +18,20 @@ if !ERRORLEVEL! neq 0 (
     exit /b 1
 )
 
+:: Ensure node_modules are installed
+if not exist "node_modules\" (
+    echo [INFO] node_modules folder is missing. Installing production dependencies...
+    call npm install --omit=dev
+    if !ERRORLEVEL! neq 0 (
+        echo [ERROR] Failed to install dependencies.
+        echo Please run setup.bat or setup-non-iis.bat first to configure the application.
+        echo.
+        pause
+        exit /b 1
+    )
+    echo.
+)
+
 :: If a command line parameter is provided, execute directly
 if "%~1"=="--sync" goto run_sync
 if "%~1"=="--temp" goto run_temp

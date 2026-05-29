@@ -36,19 +36,17 @@ This release includes a `setup.bat` script that automatically sets up and regist
 4. **Access the App:** Open your browser and navigate to:
    `http://localhost:3000/` or `http://<your-server-ip>:3000/`
 
-### Method B: Standalone Console Mode
-If you prefer not to use IIS, you can run the application directly from the command line:
+### Method B: Standalone Mode (Recommended for Non-IIS Systems)
+This release includes a `setup-non-iis.bat` script that configures the application to run standalone on your Windows machine.
 
-1. Open PowerShell or Command Prompt in this folder.
-2. Install dependencies:
-   ```bash
-   npm install --production
-   ```
-3. Start the server:
-   ```bash
-   npm start
-   ```
-4. Access the App: Open your browser and navigate to `http://localhost:3000/`
+1. **Pre-install Node.js:** Make sure Node.js is installed on the machine.
+2. **Run Setup:** Double-click `setup-non-iis.bat`.
+3. **Automatic Configuration:** The script will automatically:
+   * Install required production dependencies.
+   * Ask for a custom port configuration (defaults to 3000).
+   * Generate `start-server.bat` (to run server in console), `run-hidden.vbs` (to run server silently in background), and `stop-server.bat` (to stop the running server).
+   * Offer to create a Desktop shortcut and register the app in the Windows Startup folder for automatic start at logon.
+4. **Access the App:** Open your browser and navigate to `http://localhost:<configured-port>/`
 
 ---
 

@@ -76,9 +76,14 @@ function App() {
   const [namingTargetCase, setNamingTargetCase] = useState(null);
   const [namingArtifactName, setNamingArtifactName] = useState('');
   const [downloadingOptimized, setDownloadingOptimized] = useState(false);
+  const [downloadGrayscale, setDownloadGrayscale] = useState(false);
   
   const [bundleArtifactName, setBundleArtifactName] = useState('');
+  const [bundleGrayscale, setBundleGrayscale] = useState(false);
   const [addingPhotos, setAddingPhotos] = useState(false);
+  const [uploadProgressInfo, setUploadProgressInfo] = useState(null);
+  const [oversizedError, setOversizedError] = useState(null);  // for 422 non-aggressive failures
+  const [oversizedWarning, setOversizedWarning] = useState(null); // for saved-but-over-1MB warnings
 
   // Logs state
   const [systemLogs, setSystemLogs] = useState([]);
@@ -301,8 +306,29 @@ function App() {
     return /^\d+$/.test(caseNumber.trim());
   };
 
-  const handleUploadSubmit = async (e) => {
-    e.preventDefault();
+  const pollProgress = (uploadId, setStatusText, setProgressInfo) => {
+    const interval = setInterval(async () => {
+      try {
+        const res = await fetch(`/api/progress/${uploadId}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.status === 'compressing') {
+            setProgressInfo(data);
+            const sizeStr = data.currentSize > 0 ? `(${(data.currentSize / 1024).toFixed(1)} KB)` : '';
+            const grayStr = data.grayscale ? 'Grayscale' : 'Color';
+            const pageInfo = data.totalPages > 1 ? `Page compilation` : `Image processing`;
+            setStatusText(`${pageInfo} in progress... Attempt ${data.attempt + 1} [${grayStr}] ${sizeStr}`);
+          }
+        }
+      } catch (e) {
+        // Silent error for progress endpoints
+      }
+    }, 800);
+    return interval;
+  };
+
+  const handleUploadSubmit = async (e, forceAggressive = false) => {
+    if (e && e.preventDefault) e.preventDefault();
     if (!isCaseNumberValid()) {
       showError('Please enter a valid Patient Case Number (5 to 32 characters).');
       return;
@@ -313,7 +339,7 @@ function App() {
     }
     
     // Guard check to prevent Denial of Service (DOS) or system lockup
-    if (uploadFiles.length > 150) {
+    if (uploadFiles.length > 150 && !forceAggressive) {
       const totalMB = (uploadFiles.reduce((acc, f) => acc + f.size, 0) / (1024 * 1024)).toFixed(1);
       const proceed = window.confirm(
         `⚠️ LARGE BATCH WARNING:\nYou are attempting to upload ${uploadFiles.length} files (${totalMB} MB).\n\n` +
@@ -324,56 +350,81 @@ function App() {
     }
 
     setUploading(true);
+    setUploadProgressInfo(null);
+    const activeUploadId = crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2);
     setUploadStatusText('Uploading images to server...');
     
     const formData = new FormData();
     formData.append('case_number', caseNumber.trim());
     formData.append('force_grayscale', forceGrayscale);
+    formData.append('upload_id', activeUploadId);
+    if (forceAggressive) {
+      formData.append('force_aggressive', 'true');
+    }
     
     uploadFiles.forEach(file => {
       formData.append('files', file);
     });
 
-    try {
-      // Simulate status text updates for large batches
-      const statusTimer = setTimeout(() => {
-        if (uploadFiles.length > 20) {
-          setUploadStatusText('Compressing and optimising image data (Target: < 1MB)...');
-        }
-      }, 3000);
-      
-      const statusTimer2 = setTimeout(() => {
-        if (uploadFiles.length > 50) {
-          setUploadStatusText('Generating and compiling PDF layers... This may take a few seconds.');
-        }
-      }, 7000);
+    let progressInterval = pollProgress(activeUploadId, setUploadStatusText, setUploadProgressInfo);
 
+    try {
       const res = await fetch('/api/cases/upload', {
         method: 'POST',
         body: formData
       });
 
-      clearTimeout(statusTimer);
-      clearTimeout(statusTimer2);
+      clearInterval(progressInterval);
 
       const data = await res.json();
       
       if (res.ok) {
-        showSuccess(`Case '${caseNumber}' created successfully! Optimized ${data.fileType.toUpperCase()} file size is ${(data.sizeBytes / 1024).toFixed(1)} KB.`);
-        setCaseNumber('');
-        clearQueue();
-        fetchSystemStatus();
-        fetchCases();
-        fetchLogs();
-        setActiveTab('browse');
+        const sizeTxt = `${(data.sizeBytes / 1024).toFixed(1)} KB`;
+        if (data.oversizedWarning) {
+          // Case saved but PDF is still over 1MB even after aggressive compression
+          setOversizedWarning({
+            caseNumber: caseNumber.trim(),
+            caseId: data.caseId,
+            sizeBytes: data.sizeBytes,
+            fileType: data.fileType
+          });
+          fetchSystemStatus();
+          fetchCases();
+          fetchLogs();
+          setOversizedError(null);
+          setCaseNumber('');
+          clearQueue();
+          setActiveTab('browse');
+        } else {
+          showSuccess(`Case '${caseNumber}' created successfully! Optimized ${data.fileType.toUpperCase()} file size is ${sizeTxt}.`);
+          setCaseNumber('');
+          clearQueue();
+          fetchSystemStatus();
+          fetchCases();
+          fetchLogs();
+          setOversizedError(null);
+          setActiveTab('browse');
+        }
+      } else if (res.status === 422 && data.error === 'oversized_legible') {
+        // Standard (non-aggressive) limit hit — ask user to retry with aggressive
+        setOversizedError({
+          caseNumber: caseNumber.trim(),
+          files: uploadFiles,
+          sizeBytes: data.sizeBytes,
+          isGrayscale: forceGrayscale,
+          isAddPhotos: false,
+          isAggressive: forceAggressive
+        });
       } else {
         showError(data.error || 'Failed to process case upload.');
       }
     } catch (err) {
+      clearInterval(progressInterval);
       showError('Server connection failed during upload processing.');
     } finally {
       setUploading(false);
       setUploadStatusText('');
+      setUploadProgressInfo(null);
     }
   };
 
@@ -414,12 +465,14 @@ function App() {
     }
     
     setBundleArtifactName(`${selectedCase.case.case_number}_bundle`);
+    setBundleGrayscale(false);
     setDownloadModalOpen(true);
   };
 
   const handleOpenNamingModal = (caseItem) => {
     setNamingTargetCase(caseItem);
     setNamingArtifactName(`${caseItem.case_number}_optimized`);
+    setDownloadGrayscale(false);
     setNamingModalOpen(true);
   };
 
@@ -438,7 +491,10 @@ function App() {
         headers: {
           'Content-Type': 'application/json'
         },
-        body: JSON.stringify({ name: namingArtifactName.trim() })
+        body: JSON.stringify({ 
+          name: namingArtifactName.trim(),
+          forceGrayscale: downloadGrayscale
+        })
       });
       
       if (!res.ok) {
@@ -481,27 +537,46 @@ function App() {
     }
   };
 
-  const handleAddPhotos = async (e) => {
-    const files = Array.from(e.target.files);
-    if (files.length === 0) return;
-    
-    const allowedExtensions = ['.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tiff'];
-    const validFiles = files.filter(file => {
-      const ext = file.name.slice(file.name.lastIndexOf('.')).toLowerCase();
-      return allowedExtensions.includes(ext);
-    });
-    
-    if (validFiles.length < files.length) {
-      showError('Some files were filtered out. Only image formats are allowed.');
+  const handleAddPhotos = async (e, forceAggressive = false, retryFiles = null) => {
+    let files;
+    if (e && e.target && e.target.files) {
+      files = Array.from(e.target.files);
+    } else {
+      files = retryFiles;
     }
     
-    if (validFiles.length === 0) return;
+    if (!files || files.length === 0) return;
+    
+    let validFiles = files;
+    if (e && e.target && e.target.files) {
+      const allowedExtensions = ['.jpg', '.jpeg', '.png', '.bmp', '.webp', '.tiff'];
+      validFiles = files.filter(file => {
+        const ext = file.name.slice(file.name.lastIndexOf('.')).toLowerCase();
+        return allowedExtensions.includes(ext);
+      });
+      
+      if (validFiles.length < files.length) {
+        showError('Some files were filtered out. Only image formats are allowed.');
+      }
+      
+      if (validFiles.length === 0) return;
+    }
     
     setAddingPhotos(true);
+    setUploadProgressInfo(null);
+    setUploadStatusText('Uploading new images...');
+    const activeUploadId = crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2);
+    
     const formData = new FormData();
     validFiles.forEach(file => {
       formData.append('files', file);
     });
+    formData.append('upload_id', activeUploadId);
+    if (forceAggressive) {
+      formData.append('force_aggressive', 'true');
+    }
+    
+    let progressInterval = pollProgress(activeUploadId, setUploadStatusText, setUploadProgressInfo);
     
     try {
       const caseId = selectedCase.case.id;
@@ -510,20 +585,45 @@ function App() {
         body: formData
       });
       
+      clearInterval(progressInterval);
       const data = await res.json();
+      
       if (res.ok) {
-        showSuccess(`Added ${validFiles.length} photos successfully.`);
+        if (data.oversizedWarning) {
+          setOversizedWarning({
+            caseNumber: selectedCase.case.case_number,
+            caseId,
+            sizeBytes: data.sizeBytes,
+            fileType: data.fileType
+          });
+        } else {
+          showSuccess(`Added ${validFiles.length} photos successfully.`);
+        }
         handleCaseSelect(caseId);
         fetchSystemStatus();
         fetchCases();
         fetchLogs();
+        setOversizedError(null);
+      } else if (res.status === 422 && data.error === 'oversized_legible') {
+        setOversizedError({
+          caseNumber: selectedCase.case.case_number,
+          files: validFiles,
+          sizeBytes: data.sizeBytes,
+          isGrayscale: false,
+          isAddPhotos: true,
+          targetCaseId: caseId,
+          isAggressive: forceAggressive
+        });
       } else {
         showError(data.error || 'Failed to add photos.');
       }
     } catch (err) {
+      clearInterval(progressInterval);
       showError('Server connection failed while adding photos.');
     } finally {
       setAddingPhotos(false);
+      setUploadStatusText('');
+      setUploadProgressInfo(null);
     }
   };
 
@@ -543,7 +643,8 @@ function App() {
           imageIds: selectedImages,
           format: downloadFormat,
           quality: downloadQuality,
-          name: bundleArtifactName.trim()
+          name: bundleArtifactName.trim(),
+          forceGrayscale: bundleGrayscale
         })
       });
       
@@ -618,6 +719,81 @@ function App() {
     });
     
     return Object.values(groups).sort((a, b) => b.date - a.date);
+  };
+
+  const renderProgressContent = () => {
+    const info = uploadProgressInfo;
+    const prevSizeKB = info?.prevAttemptSize ? (info.prevAttemptSize / 1024).toFixed(1) : null;
+    const currSizeKB = info?.currentSize > 0 ? (info.currentSize / 1024).toFixed(1) : null;
+    // Detect a color→grayscale transition: previous attempt was color, current is grayscale
+    const wasColorNowGray = info && info.grayscale && info.prevAttemptGrayscale === false;
+
+    return (
+      <>
+        <div className="spinner"></div>
+        {info ? (
+          <div className="progress-details" style={{ width: '100%', maxWidth: '400px', marginTop: '1rem', display: 'flex', flexDirection: 'column', gap: '0.75rem', alignItems: 'center' }}>
+            <div className="progress-title" style={{ fontWeight: 600, fontSize: '1.1rem' }}>
+              PDF Attempt {info.attempt + 1}
+              <span style={{
+                marginLeft: '0.5rem',
+                fontSize: '0.8rem',
+                fontWeight: 500,
+                padding: '0.15rem 0.5rem',
+                borderRadius: '4px',
+                background: info.grayscale ? 'rgba(107,114,128,0.25)' : 'rgba(59,130,246,0.2)',
+                color: info.grayscale ? '#9ca3af' : '#60a5fa'
+              }}>
+                {info.grayscale ? '⬛ Grayscale' : '🎨 Color'}
+              </span>
+            </div>
+            
+            {info.totalPages > 1 && (
+              <div className="progress-bar-container" style={{ width: '100%', background: 'rgba(255,255,255,0.1)', height: '8px', borderRadius: '4px', overflow: 'hidden' }}>
+                <div 
+                  className="progress-bar-fill" 
+                  style={{ 
+                    width: `${Math.min(100, Math.round((info.processedPages / info.totalPages) * 100))}%`, 
+                    background: info.grayscale ? '#6b7280' : 'var(--primary)', 
+                    height: '100%',
+                    transition: 'width 0.3s ease' 
+                  }}
+                ></div>
+              </div>
+            )}
+            
+            <div className="progress-stats" style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>
+              {info.totalPages > 1 ? (
+                <span>Processed {info.processedPages} of {info.totalPages} pages {currSizeKB ? `— ${currSizeKB} KB so far` : ''}</span>
+              ) : (
+                <span>Processing single image...</span>
+              )}
+            </div>
+            
+            {prevSizeKB && (
+              wasColorNowGray ? (
+                // Special callout: shows size drop from switching color→grayscale
+                <div style={{ fontSize: '0.8rem', width: '100%', background: 'rgba(107,114,128,0.12)', padding: '0.5rem 0.75rem', borderRadius: '6px', border: '1px solid rgba(107,114,128,0.25)' }}>
+                  <div style={{ color: '#9ca3af', marginBottom: '0.3rem', fontWeight: 600 }}>🔄 Switching to Grayscale</div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flexWrap: 'wrap' }}>
+                    <span style={{ color: '#60a5fa' }}>Color: <strong>{prevSizeKB} KB</strong></span>
+                    <span style={{ color: 'var(--text-muted)' }}>→</span>
+                    <span style={{ color: '#9ca3af' }}>Grayscale attempt in progress...</span>
+                  </div>
+                </div>
+              ) : (
+                <div className="prev-attempt-info" style={{ fontSize: '0.8rem', color: 'var(--warning)', background: 'rgba(245, 158, 11, 0.1)', padding: '0.35rem 0.75rem', borderRadius: '4px', border: '1px solid rgba(245, 158, 11, 0.2)' }}>
+                  Previous attempt ({info.prevAttemptGrayscale ? '⬛ Grayscale' : '🎨 Color'}): <strong>{prevSizeKB} KB</strong>
+                </div>
+              )
+            )}
+          </div>
+        ) : (
+          <div className="progress-text">{uploadStatusText || 'Initializing...'}</div>
+        )}
+        <div className="progress-subtext" style={{ marginTop: '0.5rem' }}>Optimising and sizing down to comply strictly with the 1MB portal limit.</div>
+      </>
+    );
   };
 
   return (
@@ -746,9 +922,7 @@ function App() {
           
           {uploading ? (
             <div className="progress-overlay">
-              <div className="spinner"></div>
-              <div className="progress-text">{uploadStatusText}</div>
-              <div className="progress-subtext">Optimising and sizing down to comply strictly with the 1MB portal limit.</div>
+              {renderProgressContent()}
             </div>
           ) : (
             <form onSubmit={handleUploadSubmit} className="upload-form-grid">
@@ -1194,8 +1368,13 @@ function App() {
             
             <div className="modal-body">
               {modalTab === 'photos' && (
-                <>
-                  {/* Summary banner */}
+                addingPhotos ? (
+                  <div className="progress-overlay" style={{ minHeight: '300px', display: 'flex', flexDirection: 'column', justifyContent: 'center', alignItems: 'center' }}>
+                    {renderProgressContent()}
+                  </div>
+                ) : (
+                  <>
+                    {/* Summary banner */}
                   <div className="modal-detail-banner">
                     <div className="detail-metric">
                       <label>Portal Upload File</label>
@@ -1318,7 +1497,8 @@ function App() {
                       </div>
                     ))}
                   </div>
-                </>
+                  </>
+                )
               )}
 
               {modalTab === 'artifacts' && (
@@ -1537,6 +1717,23 @@ function App() {
                   </label>
                 </div>
               </div>
+
+              <div className="form-group" style={{ marginTop: '1.2rem' }}>
+                <label>Color Options</label>
+                <label className="toggle-container">
+                  <input 
+                    type="checkbox" 
+                    checked={bundleGrayscale}
+                    onChange={(e) => setBundleGrayscale(e.target.checked)}
+                    disabled={bundling}
+                  />
+                  <div className="toggle-switch"></div>
+                  <div className="toggle-label">
+                    Download in Grayscale
+                    <span>Converts all pages in the bundle to black and white</span>
+                  </div>
+                </label>
+              </div>
             </div>
             
             <div className="modal-footer">
@@ -1604,6 +1801,23 @@ function App() {
                     Will be saved as: <strong>{namingArtifactName || 'untitled'}{namingTargetCase.optimized_file_type === 'pdf' ? '.pdf' : '.jpg'}</strong>
                   </span>
                 </div>
+
+                <div className="form-group" style={{ marginTop: '1.2rem' }}>
+                  <label>Color Options</label>
+                  <label className="toggle-container">
+                    <input 
+                      type="checkbox" 
+                      checked={downloadGrayscale}
+                      onChange={(e) => setDownloadGrayscale(e.target.checked)}
+                      disabled={downloadingOptimized}
+                    />
+                    <div className="toggle-switch"></div>
+                    <div className="toggle-label">
+                      Download in Grayscale
+                      <span>Converts document pages to grayscale (saves size & increases contrast)</span>
+                    </div>
+                  </label>
+                </div>
               </div>
               
               <div className="modal-footer">
@@ -1634,6 +1848,117 @@ function App() {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+      {/* ----------------------------------------------------
+          OVERSIZED LEGIBLE — STANDARD MODE RETRY DIALOG
+         ---------------------------------------------------- */}
+      {oversizedError && (
+        <div className="modal-backdrop" style={{ zIndex: 110 }} onClick={() => setOversizedError(null)}>
+          <div className="modal-container" style={{ maxWidth: '480px' }} onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <div className="modal-title">
+                <h3 style={{ color: '#f59e0b' }}>⚠️ Sizing Limitation</h3>
+                <p>Cannot meet 1MB limit at standard quality settings.</p>
+              </div>
+              <button className="btn-modal-close" onClick={() => setOversizedError(null)}>
+                <X size={20} />
+              </button>
+            </div>
+            <div className="modal-body" style={{ color: 'var(--text-color)' }}>
+              <p style={{ marginBottom: '1rem', lineHeight: '1.5' }}>
+                The compiled document is <strong>{(oversizedError.sizeBytes / 1024).toFixed(1)} KB</strong> — above the 1MB portal limit — even at standard quality and grayscale settings.
+              </p>
+              
+              <div style={{ backgroundColor: 'rgba(255,255,255,0.04)', padding: '1rem', borderRadius: '6px', marginBottom: '1.2rem', fontSize: '0.85rem' }}>
+                <strong>Options:</strong>
+                <ul style={{ paddingLeft: '1.2rem', marginTop: '0.5rem', lineHeight: '1.6' }}>
+                  <li><strong>Force aggressive sizing:</strong> Shrinks dimensions to 450px width at quality 60. The case will be <em>saved regardless</em> — even if it remains slightly over 1MB, you can browse it and selectively download specific pages.</li>
+                  <li><strong>Cancel &amp; Adjust:</strong> Remove some pages or split the upload into multiple cases.</li>
+                </ul>
+              </div>
+            </div>
+            
+            <div className="modal-footer">
+              <button 
+                className="btn-secondary" 
+                onClick={() => setOversizedError(null)}
+              >
+                Cancel &amp; Adjust
+              </button>
+              
+              <button 
+                className="btn-primary" 
+                style={{ backgroundColor: '#f59e0b', borderColor: '#f59e0b' }}
+                onClick={() => {
+                  const err = oversizedError;
+                  setOversizedError(null);
+                  if (err.isAddPhotos) {
+                    handleAddPhotos(null, true, err.files);
+                  } else {
+                    handleUploadSubmit(null, true);
+                  }
+                }}
+              >
+                Force Aggressive Sizing &amp; Save
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ----------------------------------------------------
+          OVERSIZED WARNING — CASE SAVED BUT STILL OVER 1MB
+         ---------------------------------------------------- */}
+      {oversizedWarning && (
+        <div className="modal-backdrop" style={{ zIndex: 110 }} onClick={() => setOversizedWarning(null)}>
+          <div className="modal-container" style={{ maxWidth: '500px' }} onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <div className="modal-title">
+                <h3 style={{ color: '#10b981' }}>✅ Case Saved</h3>
+                <p>Case <strong>{oversizedWarning.caseNumber}</strong> was uploaded successfully.</p>
+              </div>
+              <button className="btn-modal-close" onClick={() => setOversizedWarning(null)}>
+                <X size={20} />
+              </button>
+            </div>
+            <div className="modal-body" style={{ color: 'var(--text-color)' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem', marginBottom: '1rem', padding: '0.85rem 1rem', borderRadius: '8px', background: 'rgba(245, 158, 11, 0.1)', border: '1px solid rgba(245, 158, 11, 0.25)' }}>
+                <AlertCircle size={20} style={{ color: '#f59e0b', flexShrink: 0 }} />
+                <div>
+                  <div style={{ fontWeight: 600, color: '#f59e0b', fontSize: '0.9rem' }}>Compiled file is {(oversizedWarning.sizeBytes / 1024).toFixed(1)} KB — above the 1MB portal limit</div>
+                  <div style={{ fontSize: '0.8rem', color: 'var(--text-secondary)', marginTop: '0.2rem' }}>Even with aggressive compression, this batch is too large to fit under 1MB.</div>
+                </div>
+              </div>
+
+              <div style={{ backgroundColor: 'rgba(255,255,255,0.04)', padding: '1rem', borderRadius: '6px', fontSize: '0.85rem', lineHeight: '1.6' }}>
+                <strong>What you can do:</strong>
+                <ul style={{ paddingLeft: '1.2rem', marginTop: '0.5rem' }}>
+                  <li>Open the case and <strong>select specific pages</strong> to download as a smaller bundle instead of all pages at once.</li>
+                  <li>Use <strong>Download Selected Bundle</strong> to get a subset of pages that fits under 1MB.</li>
+                  <li>Or split the pages across multiple separate cases.</li>
+                </ul>
+              </div>
+            </div>
+            
+            <div className="modal-footer">
+              <button 
+                className="btn-secondary" 
+                onClick={() => setOversizedWarning(null)}
+              >
+                Dismiss
+              </button>
+              <button 
+                className="btn-primary"
+                onClick={() => {
+                  setOversizedWarning(null);
+                  setActiveTab('browse');
+                }}
+              >
+                Browse Case &amp; Select Pages
+              </button>
+            </div>
           </div>
         </div>
       )}

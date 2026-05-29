@@ -48,6 +48,7 @@ copy "db.js" "release\" >nul
 copy "clean.js" "release\" >nul
 copy "clean.bat" "release\" >nul
 copy "setup.bat" "release\" >nul
+copy "setup-non-iis.bat" "release\" >nul
 copy "web.config" "release\" >nul
 copy "package.json" "release\" >nul
 copy "LICENSE" "release\" >nul
